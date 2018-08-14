@@ -2,38 +2,37 @@
 
 -behaviour(gen_server).
 
--export([start_link/3, start_link/4, start_link/5, start_link/6]).
+-export([start_link/1, start_link/2, start_link/3, start_link/4]).
 -export([init/1, handle_call/3, handle_cast/2,
          handle_info/2, terminate/2, code_change/3]).
 
--record(cache, {name, datum_index, data_module, 
-                reaper_pid, data_accessor, cache_size,
-                cache_policy, default_ttl}).
+-record(cache, {name, datum_index,
+                reaper_pid, cache_size,
+                cache_policy, default_ttl, nodes}).
 
--record(datum, {key, mgr, data, started, ttl_reaper = nil,
-                last_active, ttl, type = mru, remaining_ttl}).
+-record(datum, {key, data, started, ttl_reaper = nil, last_active, ttl, type = mru, remaining_ttl}).
 
 % make 8 MB cache
-start_link(Name, Mod, Fun) ->
-  start_link(Name, Mod, Fun, 8).
+start_link(Name) ->
+  start_link(Name, 64).
 
-% make 5 minute expiry cache
-start_link(Name, Mod, Fun, CacheSize) ->
-  start_link(Name, Mod, Fun, CacheSize, 300000).
+% make 1 minute expiry cache
+start_link(Name, CacheSize) ->
+  start_link(Name, CacheSize, 60000).
 
 % make MRU policy cache
-start_link(Name, Mod, Fun, CacheSize, CacheTime) ->
-  start_link(Name, Mod, Fun, CacheSize, CacheTime, mru).
+start_link(Name, CacheSize, CacheTime) ->
+  start_link(Name, CacheSize, CacheTime, mru).
 
-start_link(Name, Mod, Fun, CacheSize, CacheTime, CachePolicy) ->
-  gen_server:start_link({local, Name}, 
-    ?MODULE, [Name, Mod, Fun, CacheSize, CacheTime, CachePolicy], []).
+start_link(Name, CacheSize, CacheTime, CachePolicy) ->
+  gen_server:start_link({global, Name},
+    ?MODULE, [Name, CacheSize, CacheTime, CachePolicy], []).
 
 %%%----------------------------------------------------------------------
 %%% Callback functions from gen_server
 %%%----------------------------------------------------------------------
 
-init([Name, Mod, Fun, CacheSize, CacheTime, CachePolicy]) ->
+init([Name, CacheSize, CacheTime, CachePolicy]) ->
   DatumIndex = ets:new(Name, [set,
                               compressed,  % yay compression
                               public,      % public because we spawn writers
@@ -46,54 +45,29 @@ init([Name, Mod, Fun, CacheSize, CacheTime, CachePolicy]) ->
                  erlang:monitor(process, ReaperPid)
   end,
 
+  NodeList = erlang:nodes(),
   State = #cache{name = Name,
                  datum_index = DatumIndex,
-                 data_module = Mod,
-                 data_accessor = Fun,
                  reaper_pid = ReaperPid,
                  default_ttl = CacheTime,
                  cache_policy = CachePolicy,
-                 cache_size = CacheSizeBytes},
+                 cache_size = CacheSizeBytes,
+                 nodes = NodeList
+                },
+  error_logger:info_msg("ecache server state: ~p~n", [State]),
+  lager:start(),
   {ok, State}.
 
-locate(DatumKey, #cache{datum_index = DatumIndex, data_module = DataModule,
-                  default_ttl = DefaultTTL, cache_policy = Policy,
-                  data_accessor = DataAccessor} = State) ->
-  case fetch_data(key(DatumKey), State) of 
-    {ecache, notfound} -> Data = launch_datum(DatumKey, DatumIndex, DataModule,
-                                              DataAccessor, DefaultTTL, Policy),
-                          {launched, Data};
-    Data -> {found, Data}
+locate(Key, State) ->
+  case fetch_data(Key, State) of
+    {ecache, notfound} ->
+      {not_found, nil};
+    Data ->
+      {found, Data}
   end.
-
-locate_memoize(DatumKey, DatumIndex, DataModule,
-               DataAccessor, DefaultTTL, Policy, State) ->
-  case fetch_data(key(DataModule, DataAccessor, DatumKey), State) of
-    {ecache, notfound} -> Data = launch_memoize_datum(DatumKey,
-                                   DatumIndex, DataModule,
-                                   DataAccessor, DefaultTTL, Policy),
-                          {launched, Data};
-    Data -> {found, Data}
-  end.
-
-handle_call({generic_get, M, F, Key}, From, #cache{datum_index = DatumIndex,
-    data_module = _DataModule,
-    default_ttl = DefaultTTL,
-    cache_policy = Policy,
-    data_accessor = _DataAccessor} = State) ->
-%    io:format("Requesting: ~p:~p(~p)~n", [M, F, Key]),
-  spawn(fun() ->
-          Reply = 
-            case locate_memoize(Key, DatumIndex, M, F,
-                                DefaultTTL, Policy, State) of
-              {_, Data} -> Data
-            end,
-          gen_server:reply(From, Reply)
-        end),
-  {noreply, State};
 
 handle_call({get, Key}, From, #cache{datum_index = _DatumIndex} = State) ->
-%    io:format("Requesting: (~p)~n", [Key]),
+  error_logger:info_msg("Requesting: (~p)~n", [Key]),
   spawn(fun() ->
           Reply = 
           case locate(Key, State) of
@@ -131,45 +105,24 @@ handle_call(reap_oldest, _From, #cache{datum_index = DatumIndex} = State) ->
               os:timestamp(),
               DatumIndex),
   ets:delete(DatumIndex, LeastActive),
-  {from, ok, State};
+  {from, ok, State}.
 
-handle_call({rand, Type, Count}, From, 
-  #cache{datum_index = DatumIndex} = State) ->
-  spawn(fun() ->
-          AllKeys = get_all_keys(DatumIndex),
-          Length = length(AllKeys),
-          FoundData = 
-          case Length =< Count of
-            true  -> case Type of
-                       data -> [fetch_data(P, State) || P <- AllKeys];
-                       keys -> [unkey(K) || K <- AllKeys]
-                     end;
-            false ->  RandomSet  = [crypto:rand_uniform(1, Length) || 
-                                      _ <- lists:seq(1, Count)],
-                      RandomKeys = [lists:nth(Q, AllKeys) || Q <- RandomSet],
-                      case Type of
-                        data -> [fetch_data(P, State) || P <- RandomKeys];
-                        keys -> [unkey(K) || K <- RandomKeys]
-                      end
-          end,
-          gen_server:reply(From, FoundData)
-        end),
-  {noreply, State};
-  
-handle_call(Arbitrary, _From, State) ->
-  {reply, {arbitrary, Arbitrary}, State}.
-
-handle_cast({dirty, Id, NewData}, State) ->
-  replace_datum(key(Id), NewData, State),
+handle_cast({insert, Key, Value}, #cache{datum_index = DatumIndex, default_ttl = TTL, cache_policy = CachePolicy, nodes = Nodes} = State) ->
+  Datum = create_datum(Key, Value, TTL, CachePolicy),
+  error_logger:info_msg("my cache data detail: ~p~n", [Datum]),
+  case Nodes of
+    [] ->
+      launch_datum_ttl_reaper(DatumIndex, Key, Datum, erlang:node());
+    Nodes when length(Nodes) > 0 ->
+      Index = rand:uniform(length(Nodes)),
+      Node = lists:nth(Index,Nodes),
+      launch_datum_ttl_reaper(DatumIndex, Key, Datum, Node)
+  end,
+  ets:insert(DatumIndex, Datum),
   {noreply, State};
 
-handle_cast({dirty, Id}, #cache{datum_index = DatumIndex} = State) ->
-  ets:delete(DatumIndex, key(Id)),
-  {noreply, State};
-
-handle_cast({generic_dirty, M, F, A}, 
-    #cache{datum_index = DatumIndex} = State) ->
-  ets:delete(DatumIndex, key(M, F, A)),
+handle_cast({del, Key}, #cache{datum_index = DatumIndex} = State) ->
+  ets:delete(DatumIndex, Key),
   {noreply, State}.
 
 terminate(_Reason, _State) ->
@@ -193,19 +146,6 @@ handle_info(Info, State) ->
 code_change(_OldVsn, State, _Extra) ->
   {ok, State}.
 
--compile({inline, [{key, 1}, {key, 3}]}).
--compile({inline, [{unkey, 1}]}).
-% keys are tagged/boxed so you can't cross-pollute a cache when using
-% memoize mode versus the normal one-key-per-arg mode.
-% Implication: *always* add key(Key) to keys from a user.  Don't pass user
-% created keys directly to ets.
-% The boxing overhead on 64 bit systems is: atom + tuple = 8 + 16 = 24 bytes
-% The boxing overhead on 32 bit systems is: atom + tuple = 4 +  8 = 12 bytes
-key(M, F, A) -> {ecache_multi, {M, F, A}}.
-key(Key)     -> {ecache_plain, Key}.
-unkey({ecache_plain, Key}) -> Key;
-unkey({ecache_multi, {M, F, A}}) -> {M, F, A}.
-
 %% ===================================================================
 %% Private
 %% ===================================================================
@@ -219,97 +159,31 @@ create_datum(DatumKey, Data, TTL, Type) ->
 
 reap_after(EtsIndex, Key, LifeTTL) ->
   receive
-    {update_ttl, NewTTL} -> reap_after(EtsIndex, Key, NewTTL)
+    {update_ttl, NewTTL} ->
+      reap_after(EtsIndex, Key, NewTTL)
   after
-    LifeTTL -> ets:delete(EtsIndex, Key),
-               exit(self(), kill)
+    LifeTTL ->
+      error_logger:info_msg("time to delete the cache: ~p:~p~n", [EtsIndex,Key]),
+      ets:delete(EtsIndex, Key)
+      %%exit(self(), kill)
   end.
 
-launch_datum_ttl_reaper(_, _, #datum{remaining_ttl = unlimited} = Datum) ->
+launch_datum_ttl_reaper(_, _, #datum{remaining_ttl = unlimited} = Datum, _) ->
   Datum;
-launch_datum_ttl_reaper(EtsIndex, Key, #datum{remaining_ttl = TTL} = Datum) ->
-  Reaper = spawn_link(fun() -> reap_after(EtsIndex, Key, TTL) end),
-  Datum#datum{ttl_reaper = Reaper}.
-
-
--compile({inline, [{datum_error, 2}]}).
-datum_error(How, What) -> {ecache_datum_error, {How, What}}.
-
-launch_datum(Key, EtsIndex, Module, Accessor, TTL, CachePolicy) ->
-  try Module:Accessor(Key) of
-    CacheData -> UseKey = key(Key),
-                 Datum = create_datum(UseKey, CacheData, TTL, CachePolicy),
-                 LaunchedDatum =
-                   launch_datum_ttl_reaper(EtsIndex, UseKey, Datum),
-                 ets:insert(EtsIndex, LaunchedDatum),
-                 CacheData
-  catch
-    How:What -> datum_error({How, What}, erlang:get_stacktrace())
-  end.
-
-launch_memoize_datum(Key, EtsIndex, Module, Accessor, TTL, CachePolicy) ->
-  try Module:Accessor(Key) of
-    CacheData -> UseKey = key(Module, Accessor, Key),
-                 Datum = create_datum(UseKey, CacheData, TTL, CachePolicy),
-                 LaunchedDatum =
-                   launch_datum_ttl_reaper(EtsIndex, UseKey, Datum),
-                 ets:insert(EtsIndex, LaunchedDatum),
-                 CacheData
-  catch
-    How:What -> datum_error({How, What}, erlang:get_stacktrace())
-  end.
-
+launch_datum_ttl_reaper(EtsIndex, Key, #datum{remaining_ttl = TTL} = Datum, Node) ->
+    Reaper = spawn(Node, fun() -> reap_after(EtsIndex, Key, TTL) end),
+    Datum#datum{ttl_reaper = Reaper}.
 
 -compile({inline, [{data_from_datum, 1}]}).
 data_from_datum(#datum{data = Data}) -> Data.
 
--compile({inline, [{ping_reaper, 2}]}).
-ping_reaper(Reaper, NewTTL) when is_pid(Reaper) ->
-  Reaper ! {update_ttl, NewTTL};
-ping_reaper(_, _) -> ok.
-
-update_ttl(DatumIndex, #datum{key = Key, ttl = unlimited}) ->
-  NewNow = {#datum.last_active, os:timestamp()},
-  ets:update_element(DatumIndex, Key, NewNow);
-update_ttl(DatumIndex, #datum{key = Key, started = Started, ttl = TTL,
-                  type = actual_time, ttl_reaper = Reaper}) ->
-  Timestamp = os:timestamp(),
-  % Get total time in seconds this datum has been running.  Convert to ms.
-  StartedNowDiff = timer:now_diff(Timestamp, Started) div 1000,
-  % If we are less than the TTL, update with TTL-used (TTL in ms too)
-  % else, we ran out of time.  expire on next loop.
-  TTLRemaining = if
-                   StartedNowDiff < TTL -> TTL - StartedNowDiff;
-                                   true -> 0
-                 end,
-
-  ping_reaper(Reaper, TTLRemaining),
-  NewNowTTL = [{#datum.last_active, Timestamp},
-               {#datum.remaining_ttl, TTLRemaining}],
-  ets:update_element(DatumIndex, Key, NewNowTTL);
-update_ttl(DatumIndex, #datum{key = Key, ttl = TTL, ttl_reaper = Reaper}) ->
-  ping_reaper(Reaper, TTL),
-  ets:update_element(DatumIndex, Key, {#datum.last_active, os:timestamp()}).
-
-fetch_data(Key, #cache{datum_index = DatumIndex}) when is_tuple(Key) ->
+fetch_data(Key, #cache{datum_index = DatumIndex}) ->
   case ets:lookup(DatumIndex, Key) of
-    [Datum] -> update_ttl(DatumIndex, Datum),
-               data_from_datum(Datum);
-         [] -> {ecache, notfound}
+    [Datum] ->
+      data_from_datum(Datum);
+    [] ->
+      {ecache, notfound}
   end.
-
-replace_datum(Key, Data, #cache{datum_index = DatumIndex}) when is_tuple(Key) ->
-  NewDataActive = [{#datum.data, Data}, {#datum.last_active, os:timestamp()}],
-  ets:update_element(DatumIndex, Key, NewDataActive),
-  Data.
-
-get_all_keys(EtsIndex) ->
-  get_all_keys(EtsIndex, ets:first(EtsIndex), []).
-
-get_all_keys(_, '$end_of_table', Accum) ->
-  Accum;
-get_all_keys(EtsIndex, NextKey, Accum) ->
-  get_all_keys(EtsIndex, ets:next(EtsIndex, NextKey), [NextKey | Accum]).
 
 %% ===================================================================
 %% Data Abstraction

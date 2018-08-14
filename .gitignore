@@ -3,3 +3,8 @@ ebin/
 tags
 .eunit/
 *.beam
+.idea/
+*iml
+log/
+_build/
+rebar.lock
